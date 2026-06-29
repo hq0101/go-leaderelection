@@ -11,38 +11,47 @@ import (
 	"time"
 
 	leaderelection "github.com/hq0101/go-leaderelection"
+	consullock "github.com/hq0101/go-leaderelection/resourcelock/consul"
 
-	redis "github.com/redis/go-redis/v9"
+	consulapi "github.com/hashicorp/consul/api"
 )
 
 func main() {
-	redisAddr := flag.String("redis-addr", "192.168.127.131:6379", "Redis address")
-	redisUsername := flag.String("redis-username", "", "Redis username")
-	redisPassword := flag.String("redis-password", "123456", "Redis password")
-	redisDB := flag.Int("redis-db", 0, "Redis database")
+	consulAddr := flag.String("consul-addr", "127.0.0.1:8500", "Consul HTTP address")
+	consulToken := flag.String("consul-token", "", "Consul ACL token (optional)")
 	lockName := flag.String("lock", "example-leader-election", "leader election lock name")
 	identity := flag.String("id", defaultIdentity(), "leader identity")
-	leaseDuration := flag.Duration("lease-duration", 15*time.Second, "lease duration")
+	leaseDuration := flag.Duration("lease-duration", 15*time.Second, "lease duration (Consul session TTL, ≥10s)")
 	renewDeadline := flag.Duration("renew-deadline", 10*time.Second, "renew deadline")
 	retryPeriod := flag.Duration("retry-period", 2*time.Second, "retry period")
-	releaseOnCancel := flag.Bool("release-on-cancel", true, "release lock when shutting down")
+	releaseOnCancel := flag.Bool("release-on-cancel", true, "release lock on shutdown")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	client := redis.NewClient(newRedisOptions(*redisAddr, *redisUsername, *redisPassword, *redisDB))
-	defer client.Close()
+	cfg := consulapi.DefaultConfig()
+	cfg.Address = *consulAddr
+	if *consulToken != "" {
+		cfg.Token = *consulToken
+	}
+	client, err := consulapi.NewClient(cfg)
+	if err != nil {
+		log.Fatalf("create consul client: %v", err)
+	}
 
-	elector, err := leaderelection.NewLeaderElector(leaderelection.Config{
-		LockName:        *lockName,
-		Identity:        *identity,
+	lock, err := consullock.New(client, *lockName, *identity, *leaseDuration)
+	if err != nil {
+		log.Fatalf("create consul lock: %v", err)
+	}
+
+	elector, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
+		Lock:            lock,
 		LeaseDuration:   *leaseDuration,
 		RenewDeadline:   *renewDeadline,
 		RetryPeriod:     *retryPeriod,
 		ReleaseOnCancel: *releaseOnCancel,
-		RedisClient:     client,
-		Callbacks: leaderelection.Callbacks{
+		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
 				log.Printf("started leading as %s", *identity)
 				ticker := time.NewTicker(time.Second)
@@ -69,18 +78,9 @@ func main() {
 		log.Fatalf("create leader elector: %v", err)
 	}
 
-	log.Printf("starting leader election identity=%s lock=%s redis=%s", *identity, *lockName, *redisAddr)
+	log.Printf("starting leader election identity=%s lock=%s consul=%s", *identity, *lockName, *consulAddr)
 	elector.Run(ctx)
 	log.Print("leader election stopped")
-}
-
-func newRedisOptions(addr, username, password string, db int) *redis.Options {
-	return &redis.Options{
-		Addr:     addr,
-		Username: username,
-		Password: password,
-		DB:       db,
-	}
 }
 
 func defaultIdentity() string {
